@@ -1394,7 +1394,7 @@ static void ToggleAutoStart() {
         int bat = g_batteryPct;
         char buf[160];
         snprintf(buf, sizeof(buf),
-                 "CPU %.0f%%  GPU 0%%  RAM %.0f%%  SSD %.0f%%  BAT %s%d%%  \xE2\x97\x8F %s  \xE2\x97\x8F %s",
+                 "CPU %.0f%%  GPU 0%%  RAM %.0f%%  SSD %.0f%%  BAT %s%d%%  \xE2\x86\x91 %s  \xE2\x86\x93 %s",
                  g_totalCpu,
                  ramPct,
                  diskPct,
@@ -1461,7 +1461,7 @@ static void ToggleAutoStart() {
             int bat = g_batteryPct;
             char buf[160];
             snprintf(buf, sizeof(buf),
-                     "CPU %.0f%%  GPU 0%%  RAM %.0f%%  SSD %.0f%%  BAT %s%d%%  \xE2\x97\x8F %s  \xE2\x97\x8F %s",
+                     "CPU %.0f%%  GPU 0%%  RAM %.0f%%  SSD %.0f%%  BAT %s%d%%  \xE2\x86\x91 %s  \xE2\x86\x93 %s",
                      g_totalCpu,
                      ramPct,
                      diskPct,
