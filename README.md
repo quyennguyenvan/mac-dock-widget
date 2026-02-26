@@ -79,3 +79,4 @@ Single-file C++ application (~600 lines) with zero external dependencies beyond 
 - **ip-api.com** — public IP + geolocation (free, no key)
 - **Open-Meteo** — weather data (free, no key)
 # mac-dock-widget
+# mac-dock-widget
