@@ -1408,6 +1408,18 @@ static void ToggleAutoStart() {
     }
 }
 
+- (void)disableStatusTextModeIfNeeded {
+    if (!g_statusTextMode) return;
+    g_statusTextMode = false;
+    if (self.statusItem) {
+        self.statusItem.button.title = @"📊";
+        NSMenuItem *txtItem = [self.statusItem.menu itemWithTitle:@"Run in Top Bar (text)"];
+        if (txtItem) {
+            txtItem.state = NSControlStateValueOff;
+        }
+    }
+}
+
 - (void)toggleWidget:(id)sender {
     NSMenuItem *item = (NSMenuItem *)sender;
     if (self.window.isVisible) {
@@ -1415,6 +1427,7 @@ static void ToggleAutoStart() {
         HideTip();
         item.title = @"Show Widget";
     } else if (!g_widgetDocked) {
+        [self disableStatusTextModeIfNeeded];
         [self.window orderFrontRegardless];
         item.title = @"Hide Widget";
     }
@@ -1518,6 +1531,7 @@ static void ToggleAutoStart() {
         g_widgetDocked = false;
         item.title = @"Dock as Widget";
     } else {
+        [self disableStatusTextModeIfNeeded];
         [self.window orderOut:nil];
         HideTip();
         [self repositionWidgetPanel];
