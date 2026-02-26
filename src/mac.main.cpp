@@ -6,6 +6,8 @@
 
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <IOKit/ps/IOPowerSources.h>
+#import <IOKit/ps/IOPSKeys.h>
 
 #include <mach/mach.h>
 #include <mach/processor_info.h>
@@ -104,6 +106,10 @@ static std::atomic<bool> g_windowBehind{false};
 // Widget panel docked state
 static bool g_widgetDocked = false;
 static std::atomic<bool> g_wpanelBehind{false};
+
+// Status item mode (icon vs text stats in macOS top bar)
+static bool g_statusTextMode = false;
+static int  g_batteryPct = -1;
 
 // ===================================================================
 // Utility: format helpers
@@ -326,6 +332,33 @@ static void UpdateDisk() {
         vols.push_back(v);
     }
     g_vols = vols;
+}
+
+// ===================================================================
+// Battery monitoring (for top-bar text mode)
+// ===================================================================
+static void UpdateBattery() {
+    g_batteryPct = -1;
+    CFTypeRef blob = IOPSCopyPowerSourcesInfo();
+    if (!blob) return;
+    CFArrayRef list = IOPSCopyPowerSourcesList(blob);
+    if (!list) { CFRelease(blob); return; }
+    CFIndex count = CFArrayGetCount(list);
+    for (CFIndex i = 0; i < count; i++) {
+        CFTypeRef ps = CFArrayGetValueAtIndex(list, i);
+        CFDictionaryRef desc = IOPSGetPowerSourceDescription(blob, ps);
+        if (!desc) continue;
+        CFNumberRef cur = (CFNumberRef)CFDictionaryGetValue(desc, CFSTR(kIOPSCurrentCapacityKey));
+        CFNumberRef max = (CFNumberRef)CFDictionaryGetValue(desc, CFSTR(kIOPSMaxCapacityKey));
+        if (!cur || !max) continue;
+        int c = 0, m = 0;
+        CFNumberGetValue(cur, kCFNumberIntType, &c);
+        CFNumberGetValue(max, kCFNumberIntType, &m);
+        if (m > 0) g_batteryPct = (int)lrint((double)c * 100.0 / (double)m);
+        break;
+    }
+    CFRelease(list);
+    CFRelease(blob);
 }
 
 // ===================================================================
@@ -1261,6 +1294,9 @@ static void ToggleAutoStart() {
     [menu addItem:toggleItem];
     NSMenuItem *dockItem = [[NSMenuItem alloc] initWithTitle:@"Dock as Widget" action:@selector(toggleDockWidget:) keyEquivalent:@"d"];
     [menu addItem:dockItem];
+    NSMenuItem *statusTextItem = [[NSMenuItem alloc] initWithTitle:@"Run in Top Bar (text)" action:@selector(toggleStatusText:) keyEquivalent:@""];
+    statusTextItem.state = g_statusTextMode ? NSControlStateValueOn : NSControlStateValueOff;
+    [menu addItem:statusTextItem];
     [menu addItem:[NSMenuItem separatorItem]];
     NSMenuItem *autoItem = [[NSMenuItem alloc] initWithTitle:@"Auto Start" action:@selector(toggleAutoStart:) keyEquivalent:@""];
     autoItem.state = IsAutoStartEnabled() ? NSControlStateValueOn : NSControlStateValueOff;
@@ -1328,11 +1364,47 @@ static void ToggleAutoStart() {
     UpdateDisk();
     UpdateNet();
     UpdateLanIP();
+    UpdateBattery();
     UpdateWindowBehind(self.window);
     [self.monitorView setNeedsDisplay:YES];
     if (self.widgetPanel.isVisible) {
         UpdateWindowBehind(self.widgetPanel, &g_wpanelBehind);
         [self.widgetPanelView setNeedsDisplay:YES];
+    }
+    // Update status item text in top bar if enabled
+    if (g_statusTextMode && self.statusItem) {
+        double ramPct = g_ramTotalMB > 0 ? (double)g_ramUsedMB * 100.0 / g_ramTotalMB : 0;
+        // Primary disk (same logic as dock widget)
+        double diskUsed = 0, diskTotal = 0;
+        for (const auto& v : g_vols) {
+            if (v.letter == '/' || v.mount == "/" || v.mount == "/System/Volumes/Data") {
+                diskUsed = v.usedGB;
+                diskTotal = v.totalGB;
+                break;
+            }
+        }
+        if (diskTotal == 0 && !g_vols.empty()) {
+            diskUsed = g_vols[0].usedGB;
+            diskTotal = g_vols[0].totalGB;
+        }
+        double diskPct = (diskTotal > 0) ? (diskUsed * 100.0 / diskTotal) : 0;
+
+        std::string upS = FmtSpeed(g_netUp);
+        std::string dnS = FmtSpeed(g_netDown);
+        int bat = g_batteryPct;
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "CPU %.0f%%  GPU 0%%  RAM %.0f%%  SSD %.0f%%  BAT %s%d%%  \xE2\x97\x8F %s  \xE2\x97\x8F %s",
+                 g_totalCpu,
+                 ramPct,
+                 diskPct,
+                 (bat >= 0 ? "" : "- "),
+                 (bat >= 0 ? bat : 1),
+                 upS.c_str(),
+                 dnS.c_str());
+        self.statusItem.button.title = [NSString stringWithUTF8String:buf];
+    } else if (self.statusItem && !g_statusTextMode) {
+        self.statusItem.button.title = @"📊";
     }
 }
 
@@ -1345,6 +1417,60 @@ static void ToggleAutoStart() {
     } else if (!g_widgetDocked) {
         [self.window orderFrontRegardless];
         item.title = @"Hide Widget";
+    }
+}
+
+- (void)toggleStatusText:(id)sender {
+    g_statusTextMode = !g_statusTextMode;
+    NSMenuItem *item = (NSMenuItem *)sender;
+    item.state = g_statusTextMode ? NSControlStateValueOn : NSControlStateValueOff;
+
+    // When running in top bar only, hide all on-screen widgets (top HUD + dock widget)
+    if (g_statusTextMode) {
+        if (self.window && self.window.isVisible) {
+            [self.window orderOut:nil];
+            HideTip();
+        }
+        if (self.widgetPanel && self.widgetPanel.isVisible) {
+            [self.widgetPanel orderOut:nil];
+            g_widgetDocked = false;
+        }
+    }
+
+    // Force immediate update of the status item title
+    if (self.statusItem) {
+        if (!g_statusTextMode) {
+            self.statusItem.button.title = @"📊";
+        } else {
+            double ramPct = g_ramTotalMB > 0 ? (double)g_ramUsedMB * 100.0 / g_ramTotalMB : 0;
+            double diskUsed = 0, diskTotal = 0;
+            for (const auto& v : g_vols) {
+                if (v.letter == '/' || v.mount == "/" || v.mount == "/System/Volumes/Data") {
+                    diskUsed = v.usedGB;
+                    diskTotal = v.totalGB;
+                    break;
+                }
+            }
+            if (diskTotal == 0 && !g_vols.empty()) {
+                diskUsed = g_vols[0].usedGB;
+                diskTotal = g_vols[0].totalGB;
+            }
+            double diskPct = (diskTotal > 0) ? (diskUsed * 100.0 / diskTotal) : 0;
+            std::string upS = FmtSpeed(g_netUp);
+            std::string dnS = FmtSpeed(g_netDown);
+            int bat = g_batteryPct;
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "CPU %.0f%%  GPU 0%%  RAM %.0f%%  SSD %.0f%%  BAT %s%d%%  \xE2\x97\x8F %s  \xE2\x97\x8F %s",
+                     g_totalCpu,
+                     ramPct,
+                     diskPct,
+                     (bat >= 0 ? "" : "- "),
+                     (bat >= 0 ? bat : 1),
+                     upS.c_str(),
+                     dnS.c_str());
+            self.statusItem.button.title = [NSString stringWithUTF8String:buf];
+        }
     }
 }
 

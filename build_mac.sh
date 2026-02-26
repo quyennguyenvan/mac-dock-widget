@@ -37,6 +37,7 @@ mkdir -p "$MACOS_DIR"
 # Compile as Objective-C++ (the file uses Cocoa / @interface syntax)
 clang++ -x objective-c++ -std=c++17 -O2 \
     -framework Cocoa \
+    -framework IOKit \
     -fobjc-arc \
     -Wno-deprecated-declarations \
     "$SRC" -o "$BINARY"
