@@ -13,7 +13,10 @@ echo "============================================"
 echo
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/src/mac.main.cpp"
+SRC_MAIN="$SCRIPT_DIR/src/mac.main.cpp"
+SRC_MAC_GLOBALS="$SCRIPT_DIR/libs/mac/mac_globals.cpp"
+SRC_EXT="$SCRIPT_DIR/libs/mac/external_mac.mm"
+SRC_METRICS="$SCRIPT_DIR/libs/mac/metrics_mac.mm"
 APP_NAME="SysMonitor"
 APP_BUNDLE="$SCRIPT_DIR/$APP_NAME.app"
 CONTENTS="$APP_BUNDLE/Contents"
@@ -34,13 +37,15 @@ echo
 rm -rf "$APP_BUNDLE"
 mkdir -p "$MACOS_DIR"
 
-# Compile as Objective-C++ (the file uses Cocoa / @interface syntax)
+# Compile as Objective-C++ (files use Cocoa / @interface syntax)
 clang++ -x objective-c++ -std=c++17 -O2 \
+    -I"$SCRIPT_DIR" \
     -framework Cocoa \
     -framework IOKit \
     -fobjc-arc \
     -Wno-deprecated-declarations \
-    "$SRC" -o "$BINARY"
+    "$SRC_MAIN" "$SRC_MAC_GLOBALS" "$SRC_EXT" "$SRC_METRICS" \
+    -o "$BINARY"
 
 if [ $? -ne 0 ]; then
     echo

@@ -33,15 +33,21 @@ set "PATH=!MSVC!\bin\Hostx64\x64;!WINSDK!\bin\!SDKVER!\x64;%PATH%"
 set "INCLUDE=!MSVC!\include;!WINSDK!\Include\!SDKVER!\ucrt;!WINSDK!\Include\!SDKVER!\um;!WINSDK!\Include\!SDKVER!\shared;!WINSDK!\Include\!SDKVER!\winrt"
 set "LIB=!MSVC!\lib\x64;!WINSDK!\Lib\!SDKVER!\ucrt\x64;!WINSDK!\Lib\!SDKVER!\um\x64"
 
-cl.exe /O2 /EHsc /DUNICODE /D_UNICODE src\main.cpp /Fe:SysMonitor.exe ^
-    /link user32.lib gdi32.lib gdiplus.lib shell32.lib iphlpapi.lib winhttp.lib advapi32.lib ole32.lib comctl32.lib ^
+cl.exe /O2 /EHsc /DUNICODE /D_UNICODE /I. ^
+    src\main.cpp ^
+    libs\globals\globals.cpp libs\util\util.cpp libs\json\json.cpp libs\http\http.cpp ^
+    libs\cpu\cpu.cpp libs\mem\mem.cpp libs\gpu\gpu.cpp libs\disk\disk.cpp libs\net\net.cpp ^
+    libs\external\external.cpp libs\tray\tray.cpp libs\gdip\gdip.cpp libs\layout\layout.cpp ^
+    libs\draw\draw.cpp libs\tooltip\tooltip.cpp ^
+    /Fe:SysMonitor.exe ^
+    /link user32.lib gdi32.lib gdiplus.lib shell32.lib iphlpapi.lib winhttp.lib advapi32.lib ole32.lib comctl32.lib dxgi.lib ^
     /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF
 
 if !ERRORLEVEL! == 0 (
     echo.
     echo [OK] Build successful!
     echo      Output: SysMonitor.exe
-    del main.obj 2>nul
+    del *.obj 2>nul
 ) else (
     echo.
     echo [FAIL] Build failed!
@@ -52,8 +58,13 @@ goto :end
 where g++ >nul 2>nul
 if %ERRORLEVEL% == 0 (
     echo [*] Using MinGW g++...
-    g++ -O2 -DUNICODE -D_UNICODE -mwindows src\main.cpp -o SysMonitor.exe ^
-        -lgdiplus -liphlpapi -lwinhttp -ladvapi32 -lole32 -lshell32 -lcomctl32
+    g++ -O2 -DUNICODE -D_UNICODE -mwindows -I. ^
+        src\main.cpp ^
+        libs\globals\globals.cpp libs\util\util.cpp libs\json\json.cpp libs\http\http.cpp ^
+        libs\cpu\cpu.cpp libs\mem\mem.cpp libs\gpu\gpu.cpp libs\disk\disk.cpp libs\net\net.cpp ^
+        libs\external\external.cpp libs\tray\tray.cpp libs\gdip\gdip.cpp libs\layout\layout.cpp ^
+        libs\draw\draw.cpp libs\tooltip\tooltip.cpp ^
+        -o SysMonitor.exe -lgdiplus -liphlpapi -lwinhttp -ladvapi32 -lole32 -lshell32 -lcomctl32 -ldxgi
     if !ERRORLEVEL! == 0 (
         echo.
         echo [OK] Build successful!

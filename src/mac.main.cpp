@@ -6,18 +6,6 @@
 
 #import <Cocoa/Cocoa.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <IOKit/ps/IOPowerSources.h>
-#import <IOKit/ps/IOPSKeys.h>
-
-#include <mach/mach.h>
-#include <mach/processor_info.h>
-#include <sys/sysctl.h>
-#include <sys/mount.h>
-#include <net/if.h>
-#include <net/if_dl.h>
-#include <ifaddrs.h>
-#include <arpa/inet.h>
-
 #include <string>
 #include <vector>
 #include <mutex>
@@ -26,6 +14,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+
+#include "libs/mac/mac_globals.h"
+#include "libs/mac/metrics_mac.h"
+#include "libs/mac/external_mac.h"
 
 // ===================================================================
 // Constants (matching Windows layout)
@@ -38,7 +30,6 @@ static const int    SEC_MEM_W       = 265;
 static const int    SEC_IPNET_W     = 215;
 static const int    SEC_WX_W        = 105;
 static const CGFloat UPDATE_SEC     = 1.0;
-static const int    BG_FETCH_SEC    = 300;
 
 // Widget panel (simulated macOS medium widget)
 static const int    WPANEL_W        = 390;
@@ -57,43 +48,6 @@ static const CGFloat kFTitle = 13;
 static const CGFloat kFVal   = 13;
 static const CGFloat kFSmall = 11;
 
-// CPU
-static int                  g_numCores  = 0;
-static std::vector<double>  g_coreUse;
-static double               g_totalCpu  = 0;
-static processor_cpu_load_info_t g_prevLoad = nullptr;
-static natural_t            g_prevCount = 0;
-
-// Memory
-static uint64_t g_ramTotalMB = 0, g_ramUsedMB = 0;
-static uint64_t g_swapTotalMB = 0, g_swapUsedMB = 0;
-
-// Disk volumes
-struct VolInfo { char letter; double usedGB; double totalGB; std::string mount; };
-static std::vector<VolInfo> g_vols;
-
-// Network speed
-static uint64_t g_netPrevIn = 0, g_netPrevOut = 0;
-static uint64_t g_netTick = 0;
-static double   g_netDown = 0, g_netUp = 0;
-static bool     g_netInit = false;
-static std::string g_lanIP = "--";
-
-// External data (background thread)
-struct ExtData {
-    std::string ip      = "Loading...";
-    std::string city    = "Loading...";
-    std::string country;
-    double      lat = 0, lon = 0;
-    double      temp = 0;
-    int         wcode = -1;
-    std::string wdesc;
-    bool        loaded = false;
-};
-static std::mutex   g_extMtx;
-static ExtData      g_ext;
-static std::atomic<bool> g_shutdown{false};
-
 // Tooltip state
 static int g_hovCore = -1;
 static int g_hovVol  = -1;
@@ -109,7 +63,6 @@ static std::atomic<bool> g_wpanelBehind{false};
 
 // Status item mode (icon vs text stats in macOS top bar)
 static bool g_statusTextMode = false;
-static int  g_batteryPct = -1;
 
 // ===================================================================
 // Utility: format helpers
@@ -135,287 +88,6 @@ static std::string FmtDisk(double gb) {
     if (gb >= 1024.0) snprintf(buf, 32, "%.1f TB", gb / 1024.0);
     else              snprintf(buf, 32, "%.1f GB", gb);
     return buf;
-}
-
-// ===================================================================
-// Minimal JSON helpers (for known API shapes)
-// ===================================================================
-static std::string JStr(const std::string& j, const std::string& key) {
-    std::string k = "\"" + key + "\"";
-    size_t p = j.find(k);
-    if (p == std::string::npos) return {};
-    p += k.size();
-    while (p < j.size() && (j[p] == ' ' || j[p] == ':' || j[p] == '\t')) p++;
-    if (p >= j.size() || j[p] != '"') return {};
-    size_t s = ++p;
-    while (p < j.size() && j[p] != '"') p++;
-    return j.substr(s, p - s);
-}
-
-static double JNum(const std::string& j, const std::string& key) {
-    std::string k = "\"" + key + "\"";
-    size_t p = j.find(k);
-    if (p == std::string::npos) return 0;
-    p += k.size();
-    while (p < j.size() && (j[p] == ' ' || j[p] == ':' || j[p] == '\t')) p++;
-    return atof(j.c_str() + p);
-}
-
-static int JInt(const std::string& j, const std::string& key) {
-    return (int)JNum(j, key);
-}
-
-// ===================================================================
-// HTTP GET using NSURLSession (synchronous on background thread)
-// ===================================================================
-static std::string HttpGet(const std::string& urlStr) {
-    @autoreleasepool {
-        NSString *ns = [NSString stringWithUTF8String:urlStr.c_str()];
-        NSURL *url = [NSURL URLWithString:ns];
-        if (!url) return {};
-        __block NSData *resultData = nil;
-        __block bool done = false;
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        cfg.timeoutIntervalForRequest = 5;
-        cfg.timeoutIntervalForResource = 8;
-        NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg];
-        NSURLSessionDataTask *task = [session dataTaskWithURL:url
-            completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-                if (!err && data) resultData = [data copy];
-                done = true;
-                dispatch_semaphore_signal(sem);
-            }];
-        [task resume];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
-        [session invalidateAndCancel];
-        if (resultData) {
-            return std::string((const char *)resultData.bytes, resultData.length);
-        }
-        return {};
-    }
-}
-
-// ===================================================================
-// Weather code → description
-// ===================================================================
-static const char* WeatherDesc(int c) {
-    switch (c) {
-    case 0:            return "Clear Sky";
-    case 1:            return "Mainly Clear";
-    case 2:            return "Partly Cloudy";
-    case 3:            return "Overcast";
-    case 45: case 48:  return "Foggy";
-    case 51: case 53: case 55: return "Drizzle";
-    case 56: case 57:  return "Freezing Drizzle";
-    case 61: case 63: case 65: return "Rain";
-    case 66: case 67:  return "Freezing Rain";
-    case 71: case 73: case 75: return "Snow";
-    case 77:           return "Snow Grains";
-    case 80: case 81: case 82: return "Showers";
-    case 85: case 86:  return "Snow Showers";
-    case 95:           return "Thunderstorm";
-    case 96: case 99:  return "Hail Storm";
-    default:           return "Unknown";
-    }
-}
-
-// ===================================================================
-// CPU monitoring
-// ===================================================================
-static uint64_t TickMs() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
-}
-
-static void InitCpu() {
-    natural_t numCPUs = 0;
-    processor_cpu_load_info_t cpuLoad = nullptr;
-    mach_msg_type_number_t cpuMsgCount = 0;
-    if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
-            &numCPUs, (processor_info_array_t *)&cpuLoad, &cpuMsgCount) == KERN_SUCCESS) {
-        g_numCores = (int)numCPUs;
-        g_coreUse.resize(g_numCores, 0.0);
-        g_prevLoad = cpuLoad;
-        g_prevCount = cpuMsgCount;
-    }
-}
-
-static void UpdateCpu() {
-    natural_t numCPUs = 0;
-    processor_cpu_load_info_t cpuLoad = nullptr;
-    mach_msg_type_number_t cpuMsgCount = 0;
-    if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
-            &numCPUs, (processor_info_array_t *)&cpuLoad, &cpuMsgCount) != KERN_SUCCESS)
-        return;
-
-    double sum = 0;
-    for (int i = 0; i < g_numCores && i < (int)numCPUs; i++) {
-        unsigned int *cur  = cpuLoad[i].cpu_ticks;
-        unsigned int *prev = g_prevLoad ? g_prevLoad[i].cpu_ticks : nullptr;
-        if (prev) {
-            unsigned int dUser = cur[CPU_STATE_USER]   - prev[CPU_STATE_USER];
-            unsigned int dSys  = cur[CPU_STATE_SYSTEM] - prev[CPU_STATE_SYSTEM];
-            unsigned int dNice = cur[CPU_STATE_NICE]   - prev[CPU_STATE_NICE];
-            unsigned int dIdle = cur[CPU_STATE_IDLE]   - prev[CPU_STATE_IDLE];
-            unsigned int dTotal = dUser + dSys + dNice + dIdle;
-            double u = dTotal > 0 ? (double)(dUser + dSys + dNice) / dTotal * 100.0 : 0;
-            if (u < 0) u = 0; if (u > 100) u = 100;
-            g_coreUse[i] = u;
-            sum += u;
-        }
-    }
-    g_totalCpu = g_numCores > 0 ? sum / g_numCores : 0;
-
-    if (g_prevLoad)
-        vm_deallocate(mach_task_self(), (vm_address_t)g_prevLoad, g_prevCount * sizeof(int));
-    g_prevLoad = cpuLoad;
-    g_prevCount = cpuMsgCount;
-}
-
-// ===================================================================
-// Memory monitoring
-// ===================================================================
-static void UpdateMem() {
-    int64_t totalMem = 0;
-    size_t len = sizeof(totalMem);
-    sysctlbyname("hw.memsize", &totalMem, &len, nullptr, 0);
-    g_ramTotalMB = totalMem / (1024 * 1024);
-
-    vm_statistics64_data_t vm;
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm, &count) == KERN_SUCCESS) {
-        vm_size_t pageSize = 0;
-        host_page_size(mach_host_self(), &pageSize);
-        uint64_t usedPages = vm.active_count + vm.wire_count + vm.compressor_page_count;
-        g_ramUsedMB = (usedPages * pageSize) / (1024 * 1024);
-    }
-
-    struct xsw_usage swap;
-    len = sizeof(swap);
-    if (sysctlbyname("vm.swapusage", &swap, &len, nullptr, 0) == 0) {
-        g_swapTotalMB = swap.xsu_total / (1024 * 1024);
-        g_swapUsedMB  = swap.xsu_used / (1024 * 1024);
-    }
-}
-
-// ===================================================================
-// Disk volume monitoring
-// ===================================================================
-static void UpdateDisk() {
-    struct statfs *mounts = nullptr;
-    int n = getmntinfo(&mounts, MNT_NOWAIT);
-    std::vector<VolInfo> vols;
-    for (int i = 0; i < n; i++) {
-        std::string fstype = mounts[i].f_fstypename;
-        std::string mp = mounts[i].f_mntonname;
-        if (fstype != "apfs" && fstype != "hfs") continue;
-        if (mp.find("/System/Volumes/") == 0 && mp != "/System/Volumes/Data") continue;
-        if (mp == "/dev" || mp == "/private/var/vm") continue;
-
-        double totalGB = (double)mounts[i].f_blocks * mounts[i].f_bsize / (1024.0*1024.0*1024.0);
-        double freeGB  = (double)mounts[i].f_bavail * mounts[i].f_bsize / (1024.0*1024.0*1024.0);
-        if (totalGB < 0.1) continue;
-
-        VolInfo v;
-        if (mp == "/" || mp == "/System/Volumes/Data")
-            v.letter = '/';
-        else {
-            size_t last = mp.rfind('/');
-            v.mount = (last != std::string::npos) ? mp.substr(last + 1) : mp;
-            v.letter = v.mount.empty() ? '?' : v.mount[0];
-        }
-        v.totalGB = totalGB;
-        v.usedGB  = totalGB - freeGB;
-        v.mount   = mp;
-        vols.push_back(v);
-    }
-    g_vols = vols;
-}
-
-// ===================================================================
-// Battery monitoring (for top-bar text mode)
-// ===================================================================
-static void UpdateBattery() {
-    g_batteryPct = -1;
-    CFTypeRef blob = IOPSCopyPowerSourcesInfo();
-    if (!blob) return;
-    CFArrayRef list = IOPSCopyPowerSourcesList(blob);
-    if (!list) { CFRelease(blob); return; }
-    CFIndex count = CFArrayGetCount(list);
-    for (CFIndex i = 0; i < count; i++) {
-        CFTypeRef ps = CFArrayGetValueAtIndex(list, i);
-        CFDictionaryRef desc = IOPSGetPowerSourceDescription(blob, ps);
-        if (!desc) continue;
-        CFNumberRef cur = (CFNumberRef)CFDictionaryGetValue(desc, CFSTR(kIOPSCurrentCapacityKey));
-        CFNumberRef max = (CFNumberRef)CFDictionaryGetValue(desc, CFSTR(kIOPSMaxCapacityKey));
-        if (!cur || !max) continue;
-        int c = 0, m = 0;
-        CFNumberGetValue(cur, kCFNumberIntType, &c);
-        CFNumberGetValue(max, kCFNumberIntType, &m);
-        if (m > 0) g_batteryPct = (int)lrint((double)c * 100.0 / (double)m);
-        break;
-    }
-    CFRelease(list);
-    CFRelease(blob);
-}
-
-// ===================================================================
-// Network speed monitoring
-// ===================================================================
-static void GetNetTotals(uint64_t &in, uint64_t &out) {
-    in = out = 0;
-    struct ifaddrs *ifap = nullptr;
-    if (getifaddrs(&ifap) != 0) return;
-    for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK) continue;
-        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
-        if (!ifa->ifa_data) continue;
-        struct if_data *ifd = (struct if_data *)ifa->ifa_data;
-        in  += ifd->ifi_ibytes;
-        out += ifd->ifi_obytes;
-    }
-    freeifaddrs(ifap);
-}
-
-static void InitNet() {
-    GetNetTotals(g_netPrevIn, g_netPrevOut);
-    g_netTick = TickMs();
-    g_netInit = true;
-}
-
-static void UpdateNet() {
-    uint64_t ci, co;
-    GetNetTotals(ci, co);
-    uint64_t now = TickMs();
-    double dt = (now - g_netTick) / 1000.0;
-    if (dt > 0.05 && g_netInit) {
-        g_netDown = (ci >= g_netPrevIn)  ? (ci - g_netPrevIn)  / dt : 0;
-        g_netUp   = (co >= g_netPrevOut) ? (co - g_netPrevOut) / dt : 0;
-    }
-    g_netPrevIn  = ci;
-    g_netPrevOut = co;
-    g_netTick    = now;
-}
-
-static void UpdateLanIP() {
-    struct ifaddrs *ifap = nullptr;
-    if (getifaddrs(&ifap) != 0) return;
-    for (struct ifaddrs *ifa = ifap; ifa; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-        if (ifa->ifa_flags & IFF_LOOPBACK) continue;
-        char buf[INET_ADDRSTRLEN];
-        struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
-        inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
-        if (strcmp(buf, "127.0.0.1") != 0) {
-            g_lanIP = buf;
-            freeifaddrs(ifap);
-            return;
-        }
-    }
-    freeifaddrs(ifap);
-    g_lanIP = "--";
 }
 
 // ===================================================================
@@ -468,112 +140,6 @@ static void UpdateWindowBehind(NSWindow *myWindow, std::atomic<bool> *target = &
 
     CFRelease(windowList);
     target->store(found);
-}
-
-// ===================================================================
-// Background data fetching (IP + geolocation + weather)
-// ===================================================================
-static void FetchExternal() {
-    // --- Phase 1: IP & geolocation ---
-    std::string ip, city, cc;
-    double lat = 0, lon = 0;
-
-    std::string ipResp = HttpGet("https://ipwho.is/");
-    if (!ipResp.empty()) {
-        ip   = JStr(ipResp, "ip");
-        city = JStr(ipResp, "city");
-        cc   = JStr(ipResp, "country_code");
-        lat  = JNum(ipResp, "latitude");
-        lon  = JNum(ipResp, "longitude");
-    }
-
-    if (ip.empty()) {
-        ipResp = HttpGet("https://ipapi.co/json/");
-        if (!ipResp.empty()) {
-            ip   = JStr(ipResp, "ip");
-            city = JStr(ipResp, "city");
-            cc   = JStr(ipResp, "country_code");
-            lat  = JNum(ipResp, "latitude");
-            lon  = JNum(ipResp, "longitude");
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(g_extMtx);
-        if (!ip.empty()) {
-            g_ext.ip      = ip;
-            g_ext.city    = city.empty() ? "Unknown" : city;
-            g_ext.country = cc;
-            g_ext.lat     = lat;
-            g_ext.lon     = lon;
-        }
-        if (lat == 0 && lon == 0) {
-            lat = g_ext.lat;
-            lon = g_ext.lon;
-        }
-        g_ext.loaded = true;
-    }
-
-    // --- Phase 2: Weather (uses cached lat/lon if IP fetch failed) ---
-    if (lat == 0 && lon == 0) return;
-
-    char wurl[256];
-    snprintf(wurl, sizeof(wurl),
-        "https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
-        "&current=temperature_2m,weather_code&current_weather=true",
-        lat, lon);
-    std::string wResp = HttpGet(wurl);
-    if (wResp.empty()) return;
-
-    double temp = 0;
-    int wcode = -1;
-    bool parsed = false;
-
-    size_t cw = wResp.find("\"current\"");
-    if (cw != std::string::npos) {
-        std::string sub = wResp.substr(cw);
-        if (sub.find("\"temperature_2m\"") != std::string::npos) {
-            temp  = JNum(sub, "temperature_2m");
-            wcode = JInt(sub, "weather_code");
-            parsed = true;
-        }
-    }
-    if (!parsed) {
-        cw = wResp.find("\"current_weather\"");
-        if (cw != std::string::npos) {
-            std::string sub = wResp.substr(cw);
-            if (sub.find("\"temperature\"") != std::string::npos) {
-                temp  = JNum(sub, "temperature");
-                wcode = JInt(sub, "weathercode");
-                parsed = true;
-            }
-        }
-    }
-
-    if (parsed) {
-        std::lock_guard<std::mutex> lk(g_extMtx);
-        g_ext.temp  = temp;
-        g_ext.wcode = wcode;
-        g_ext.wdesc = WeatherDesc(wcode);
-    }
-}
-
-static void BgThreadFunc() {
-    FetchExternal();
-    int failures = 0;
-    while (!g_shutdown.load()) {
-        int waitSec;
-        {
-            std::lock_guard<std::mutex> lk(g_extMtx);
-            bool ipOk = !g_ext.ip.empty() && g_ext.ip != "Loading...";
-            bool wxOk = g_ext.wcode >= 0;
-            if (ipOk && wxOk) { waitSec = BG_FETCH_SEC; failures = 0; }
-            else { failures++; waitSec = std::min(15 * failures, 120); }
-        }
-        for (int i = 0; i < waitSec * 10 && !g_shutdown.load(); i++)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (!g_shutdown.load()) FetchExternal();
-    }
 }
 
 // ===================================================================
