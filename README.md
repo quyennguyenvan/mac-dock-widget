@@ -1,5 +1,6 @@
 # SysMonitor
 
+
 Lightweight, transparent Windows system monitor widget written in C++ using raw Win32 API and GDI+. Designed for minimal CPU and memory footprint.
 
 ## Features
@@ -78,5 +79,3 @@ Single-file C++ application (~600 lines) with zero external dependencies beyond 
 
 - **ip-api.com** — public IP + geolocation (free, no key)
 - **Open-Meteo** — weather data (free, no key)
-# mac-dock-widget
-# mac-dock-widget

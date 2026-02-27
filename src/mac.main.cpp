@@ -272,6 +272,26 @@ static int HitTestVol(CGFloat mx, CGFloat my) {
     return -1;
 }
 
+// Hit-test per-core bars in the dock widget panel
+static int HitTestCorePanel(CGFloat mx, CGFloat my, CGFloat viewW, CGFloat viewH) {
+    (void)viewW; // currently unused but kept for symmetry/possible future layout tweaks
+    CGFloat pad = WPANEL_PAD;
+    CGFloat leftW = 135;
+    int maxVisual = (int)((leftW - 4) / 8);
+    int maxCores = g_numCores;
+    if (maxCores > maxVisual) maxCores = maxVisual;
+    CGFloat coreY = viewH - pad - 22;
+    CGFloat coreX = pad;
+    CGFloat barW = 6;
+    CGFloat barH = 18;
+    for (int i = 0; i < maxCores; i++) {
+        CGFloat bx = coreX + i * 8.0;
+        if (mx >= bx && mx < bx + barW && my >= coreY && my < coreY + barH)
+            return i;
+    }
+    return -1;
+}
+
 // ===================================================================
 // Custom tooltip window (NSView.toolTip unreliable on borderless windows)
 // ===================================================================
@@ -880,41 +900,78 @@ static void ToggleAutoStart() {
     __weak AppDelegate *weakSelf = self;
     void (^tipHandler)(NSEvent *) = ^(NSEvent *event) {
         AppDelegate *ss = weakSelf;
-        if (!ss || !ss.window.isVisible) { HideTip(); return; }
-
         NSPoint sp = [NSEvent mouseLocation];
-        NSRect wf = ss.window.frame;
-        if (!NSPointInRect(sp, wf)) {
-            if (g_hovCore >= 0 || g_hovVol >= 0) {
-                g_hovCore = -1; g_hovVol = -1;
+        if (!ss) { HideTip(); return; }
+
+        // Prefer main HUD widget if visible
+        if (ss.window && ss.window.isVisible) {
+            NSRect wf = ss.window.frame;
+            if (!NSPointInRect(sp, wf)) {
+                if (g_hovCore >= 0 || g_hovVol >= 0) {
+                    g_hovCore = -1; g_hovVol = -1;
+                    HideTip();
+                }
+                return;
+            }
+
+            CGFloat lx = sp.x - wf.origin.x;
+            CGFloat ly = wf.size.height - (sp.y - wf.origin.y);
+            int core = HitTestCore(lx, ly);
+            int vol  = (core < 0) ? HitTestVol(lx, ly) : -1;
+            g_hovCore = core;
+            g_hovVol  = vol;
+
+            if (core >= 0 && core < (int)g_coreUse.size()) {
+                char buf[64];
+                snprintf(buf, 64, "Core %d: %.1f%% usage", core, g_coreUse[core]);
+                ShowTip([NSString stringWithUTF8String:buf], sp);
+            } else if (vol >= 0 && vol < (int)g_vols.size()) {
+                double pct = g_vols[vol].totalGB > 0 ?
+                    g_vols[vol].usedGB * 100.0 / g_vols[vol].totalGB : 0;
+                double freeGB = g_vols[vol].totalGB - g_vols[vol].usedGB;
+                char buf[256];
+                snprintf(buf, 256, "Volume: %s\nUsed: %s / %s (%.1f%%)\nFree: %s",
+                         g_vols[vol].mount.c_str(),
+                         FmtDisk(g_vols[vol].usedGB).c_str(),
+                         FmtDisk(g_vols[vol].totalGB).c_str(), pct,
+                         FmtDisk(freeGB).c_str());
+                ShowTip([NSString stringWithUTF8String:buf], sp);
+            } else {
                 HideTip();
             }
             return;
         }
 
-        CGFloat lx = sp.x - wf.origin.x;
-        CGFloat ly = wf.size.height - (sp.y - wf.origin.y);
-        int core = HitTestCore(lx, ly);
-        int vol  = (core < 0) ? HitTestVol(lx, ly) : -1;
-        g_hovCore = core;
-        g_hovVol  = vol;
+        // If dock widget panel is visible instead, show per-core tooltip there
+        if (ss.widgetPanel && ss.widgetPanel.isVisible) {
+            NSRect pf = ss.widgetPanel.frame;
+            if (!NSPointInRect(sp, pf)) {
+                if (g_hovCore >= 0) {
+                    g_hovCore = -1;
+                    HideTip();
+                }
+                return;
+            }
 
-        if (core >= 0 && core < (int)g_coreUse.size()) {
-            char buf[64];
-            snprintf(buf, 64, "Core %d: %.1f%% usage", core, g_coreUse[core]);
-            ShowTip([NSString stringWithUTF8String:buf], sp);
-        } else if (vol >= 0 && vol < (int)g_vols.size()) {
-            double pct = g_vols[vol].totalGB > 0 ?
-                g_vols[vol].usedGB * 100.0 / g_vols[vol].totalGB : 0;
-            double freeGB = g_vols[vol].totalGB - g_vols[vol].usedGB;
-            char buf[256];
-            snprintf(buf, 256, "Volume: %s\nUsed: %s / %s (%.1f%%)\nFree: %s",
-                     g_vols[vol].mount.c_str(),
-                     FmtDisk(g_vols[vol].usedGB).c_str(),
-                     FmtDisk(g_vols[vol].totalGB).c_str(), pct,
-                     FmtDisk(freeGB).c_str());
-            ShowTip([NSString stringWithUTF8String:buf], sp);
-        } else {
+            CGFloat lx = sp.x - pf.origin.x;
+            CGFloat ly = pf.size.height - (sp.y - pf.origin.y);
+            int core = HitTestCorePanel(lx, ly, pf.size.width, pf.size.height);
+            g_hovCore = core;
+            g_hovVol  = -1;
+
+            if (core >= 0 && core < (int)g_coreUse.size()) {
+                char buf[64];
+                snprintf(buf, 64, "Core %d: %.1f%% usage", core, g_coreUse[core]);
+                ShowTip([NSString stringWithUTF8String:buf], sp);
+            } else {
+                HideTip();
+            }
+            return;
+        }
+
+        // Neither widget is visible; just clear any existing tooltip
+        if (g_hovCore >= 0 || g_hovVol >= 0) {
+            g_hovCore = -1; g_hovVol = -1;
             HideTip();
         }
     };
